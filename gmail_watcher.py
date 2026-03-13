@@ -36,11 +36,11 @@ CONFIG = {
     "twilio_auth_token":    os.environ["TWILIO_AUTH_TOKEN"],
     "twilio_whatsapp_from": "whatsapp:+14155238886",
     "whatsapp_numbers": [
-        os.environ.get("WHATSAPP_TO",   "+573174924147"),
+        os.environ.get("WHATSAPP_TO",   "whatsapp+573174924147"),
         os.environ.get("WHATSAPP_TO_2", ""),
         os.environ.get("WHATSAPP_TO_3", ""),
         os.environ.get("WHATSAPP_TO_4", ""),
-        os.environ.get("WHATSAPP_TO_5", "+573203446002"),
+        os.environ.get("WHATSAPP_TO_5", "whatsapp+573203446002"),
     ],
 
     "windows_notification_enabled": False,
