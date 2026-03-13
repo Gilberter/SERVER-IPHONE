@@ -1,9 +1,10 @@
 """
-iPhone Found Email Watcher
-==========================
-Monitors your Gmail for Apple's "iPhone Found" alert email.
-When detected, sends alerts to Discord and WhatsApp (multiple numbers).
-Parses Apple's Spanish email format and includes a Google Maps link.
+iPhone Found Email Watcher — Persistent + Multi-number
+=======================================================
+- Redis persistence: no duplicate alerts on redeploy
+- Multiple WhatsApp numbers via env vars
+- Parses Apple Spanish/English Find My email
+- Google Maps link from address
 """
 
 import imaplib
@@ -17,83 +18,149 @@ from urllib.parse import quote
 import sys
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION
+#  CONFIGURATION — all secrets via env vars
 # ─────────────────────────────────────────────
 
-CONFIG = {
-    # --- Gmail ---
-    "gmail_address":      os.environ["GMAIL_ADDRESS"],
-    "gmail_app_password": os.environ["GMAIL_APP_PASSWORD"],
+def load_config():
+    # Collect all WHATSAPP_TO, WHATSAPP_TO_2, WHATSAPP_TO_3... dynamically
+    numbers = []
+    # First number (required)
+    n1 = os.environ.get("WHATSAPP_TO", "")
+    if n1: numbers.append(n1 if n1.startswith("whatsapp:") else f"whatsapp:{n1}")
+    # Extra numbers (optional, add as many as you want in Railway)
+    i = 2
+    while True:
+        n = os.environ.get(f"WHATSAPP_TO_{i}", "")
+        if not n:
+            break
+        numbers.append(n if n.startswith("whatsapp:") else f"whatsapp:{n}")
+        i += 1
 
-    # --- What email to watch for ---
-    "watch_subject_keywords": ["iPhone", "encontró", "found", "located", "Find My"],
-    "watch_from_keywords":    ["apple.com", "icloud.com"],
+    return {
+        "gmail_address":      os.environ["GMAIL_ADDRESS"],
+        "gmail_app_password": os.environ["GMAIL_APP_PASSWORD"],
 
-    # --- How often to check (seconds) ---
-    "check_interval_seconds": 60,
+        "watch_subject_keywords": ["iPhone", "encontró", "encontro", "found", "located", "Find My"],
+        "watch_from_keywords":    ["apple.com", "icloud.com", "apple"],
 
-    # ─── Discord ───
-    "discord_enabled":     True,
-    "discord_webhook_url": os.environ["DISCORD_WEBHOOK_URL"],
+        "check_interval_seconds": int(os.environ.get("CHECK_INTERVAL", "60")),
 
-    # ─── WhatsApp via Twilio ───
-    # Add as many numbers as you want via env vars WHATSAPP_TO, WHATSAPP_TO_2, WHATSAPP_TO_3
-    "whatsapp_enabled":     True,
-    "twilio_account_sid":   os.environ["TWILIO_ACCOUNT_SID"],
-    "twilio_auth_token":    os.environ["TWILIO_AUTH_TOKEN"],
-    "twilio_whatsapp_from": "whatsapp:+14155238886",
-    "whatsapp_numbers": [
-        os.environ.get("WHATSAPP_TO",   "whatsapp:+573174924147"),
-        os.environ.get("WHATSAPP_TO_2", ""), # whatsapp:+573156356850
-        os.environ.get("WHATSAPP_TO_3", ""), #whatsapp:+573153038988
-        os.environ.get("WHATSAPP_TO_4", "whatsapp:+573203446002"),
-        os.environ.get("WHATSAPP_TO_5", "whatsapp:+573203446002"),
+        "discord_enabled":     True,
+        "discord_webhook_url": os.environ.get("DISCORD_WEBHOOK_URL", ""),
 
-    ],
+        "whatsapp_enabled":     bool(numbers),
 
-    # ─── Windows Desktop Notification ───
-    "windows_notification_enabled": False,
-}
+        # Primary Twilio account
+        "twilio_account_sid":   os.environ.get("TWILIO_ACCOUNT_SID", ""),
+        "twilio_auth_token":    os.environ.get("TWILIO_AUTH_TOKEN", ""),
+        "twilio_whatsapp_from": "whatsapp:+14155238886",
+
+        # Backup Twilio account (used automatically if primary hits 429 limit)
+        "twilio_backup_sid":        os.environ.get("TWILIO_BACKUP_SID", ""),
+        "twilio_backup_token":      os.environ.get("TWILIO_BACKUP_TOKEN", ""),
+        "twilio_backup_from":       os.environ.get("TWILIO_BACKUP_FROM", "whatsapp:+14155238886"),
+
+        "whatsapp_numbers":     numbers,
+    }
 
 # ─────────────────────────────────────────────
-#  PARSE APPLE'S EMAIL
+#  PERSISTENT STORAGE
 # ─────────────────────────────────────────────
 
-def parse_apple_iphone_email(subject, body):
-    """
-    Parses Apple's Spanish Find My email:
-    'iPhone de Juan David se encontró cerca de Calle 20 28-49 Bucaramanga, Santander Colombia a la(s) 15:49 COT'
-    Returns: (device_name, address, time_str, maps_url)
-    """
+class RedisStorage:
+    KEY = "iphone_watcher:seen_ids"
+
+    def __init__(self, client):
+        self.client = client
+
+    def get_seen_ids(self):
+        try:
+            return set(self.client.smembers(self.KEY))
+        except Exception as e:
+            print(f"[!] Redis read error: {e}")
+            return set()
+
+    def save_seen_ids(self, new_ids):
+        try:
+            if new_ids:
+                self.client.sadd(self.KEY, *new_ids)
+            # Cap at 10000 to avoid unbounded growth
+            size = self.client.scard(self.KEY)
+            if size > 10000:
+                self.client.spop(self.KEY, size - 10000)
+        except Exception as e:
+            print(f"[!] Redis write error: {e}")
+
+
+class FileStorage:
+    def __init__(self, path="seen_ids.txt"):
+        self.path = path
+
+    def get_seen_ids(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path) as f:
+                    return set(line.strip() for line in f if line.strip())
+        except Exception as e:
+            print(f"[!] File read error: {e}")
+        return set()
+
+    def save_seen_ids(self, new_ids):
+        try:
+            existing = self.get_seen_ids()
+            with open(self.path, "w") as f:
+                f.write("\n".join(existing | new_ids))
+        except Exception as e:
+            print(f"[!] File write error: {e}")
+
+
+def connect_storage():
+    redis_url = os.environ.get("REDIS_URL") or os.environ.get("REDIS_PRIVATE_URL")
+    if redis_url:
+        try:
+            import redis
+            client = redis.from_url(redis_url, decode_responses=True)
+            client.ping()
+            print("[✓] Redis connected — state persists across restarts.")
+            return RedisStorage(client)
+        except Exception as e:
+            print(f"[!] Redis failed ({e}) — falling back to file storage.")
+    else:
+        print("[~] No REDIS_URL found — using file storage (resets on redeploy).")
+    return FileStorage()
+
+# ─────────────────────────────────────────────
+#  PARSE APPLE EMAIL
+# ─────────────────────────────────────────────
+
+def parse_apple_email(subject, body):
     device_name = "Tu iPhone"
-    address     = None
-    time_str    = None
-    maps_url    = None
+    address = time_str = maps_url = None
 
     for text in [subject, body]:
         if not text:
             continue
 
-        # Spanish format
-        match = re.search(
-            r'(iPhone[^\.]*?)se encontr[oó] cerca de (.+?) a la\(?s?\)?\s+([\d:]+)\s*(\w+)',
+        # Spanish: "iPhone de X se encontró cerca de ADDRESS a la(s) HH:MM TZ"
+        m = re.search(
+            r'(iPhone[^\.]*?)se encontr[oó] cerca de (.+?) a la\(?s?\)?\s*([\d:]+)\s*(\w+)',
             text, re.IGNORECASE
         )
-        if match:
-            device_name = match.group(1).strip().rstrip("de ").strip()
-            address     = match.group(2).strip()
-            time_str    = f"{match.group(3)} {match.group(4)}"
+        if m:
+            device_name = m.group(1).strip().rstrip("de").strip()
+            address     = m.group(2).strip()
+            time_str    = f"{m.group(3)} {m.group(4)}"
             break
 
-        # English fallback
-        match_en = re.search(
+        # English: "iPhone was found near ADDRESS at HH:MM TZ"
+        m = re.search(
             r'(iPhone[^\.]*?)was found near (.+?) at ([\d:]+ \w+)',
             text, re.IGNORECASE
         )
-        if match_en:
-            device_name = match_en.group(1).strip()
-            address     = match_en.group(2).strip()
-            time_str    = match_en.group(3).strip()
+        if m:
+            device_name = m.group(1).strip()
+            address     = m.group(2).strip()
+            time_str    = m.group(3).strip()
             break
 
     if address:
@@ -101,215 +168,221 @@ def parse_apple_iphone_email(subject, body):
 
     return device_name, address, time_str, maps_url
 
-
 # ─────────────────────────────────────────────
-#  ALERT FUNCTIONS
+#  ALERTS
 # ─────────────────────────────────────────────
 
-def send_discord_alert(subject, sender, body_preview, device_name, address, time_str, maps_url):
-    if not CONFIG["discord_enabled"] or not CONFIG["discord_webhook_url"].startswith("http"):
+def send_discord(cfg, subject, sender, preview, device_name, address, time_str, maps_url):
+    if not cfg["discord_enabled"] or not cfg["discord_webhook_url"].startswith("http"):
         return
     try:
         fields = [
-            {"name": "📧 Subject",      "value": subject, "inline": False},
-            {"name": "📨 From",         "value": sender,  "inline": True},
-            {"name": "🕐 Alert time",   "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "inline": True},
+            {"name": "📧 Subject",    "value": subject or "(none)", "inline": False},
+            {"name": "📨 From",       "value": sender  or "(none)", "inline": True},
+            {"name": "🕐 Alert time", "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "inline": True},
         ]
         if address:
-            fields.append({"name": "📍 Location",   "value": address,  "inline": False})
+            fields.append({"name": "📍 Location",    "value": address,  "inline": False})
         if time_str:
-            fields.append({"name": "⏰ Time found", "value": time_str, "inline": True})
+            fields.append({"name": "⏰ Time found",  "value": time_str, "inline": True})
         if maps_url:
-            fields.append({"name": "🗺️ Google Maps","value": f"[📍 Open in Google Maps]({maps_url})", "inline": True})
-        if body_preview:
-            fields.append({"name": "📝 Preview",    "value": body_preview[:300] or "(empty)", "inline": False})
+            fields.append({"name": "🗺️ Google Maps", "value": f"[📍 Abrir en Google Maps]({maps_url})", "inline": True})
+        if preview:
+            fields.append({"name": "📝 Preview",     "value": preview[:300], "inline": False})
 
-        message = {
-            "embeds": [{
-                "title":       f"🚨 {device_name} ENCONTRADO — REVISA YA!",
-                "description": "Apple envió una alerta de Find My. ¡Tu iPhone puede haber sido localizado!",
-                "color":       16711680,
-                "fields":      fields,
-                "footer":      {"text": "iPhone Watcher Script"}
-            }]
-        }
-        r = requests.post(CONFIG["discord_webhook_url"], json=message, timeout=10)
-        if r.status_code in (200, 204):
-            print(f"[✓] Discord alert sent!")
-        else:
-            print(f"[✗] Discord failed: {r.status_code} {r.text}")
+        payload = {"embeds": [{
+            "title":       f"🚨 {device_name} ENCONTRADO — REVISA YA!",
+            "description": "Apple envió una alerta de Find My. ¡Tu iPhone puede haber sido localizado!",
+            "color":       16711680,
+            "fields":      fields,
+            "footer":      {"text": "iPhone Watcher"}
+        }]}
+        r = requests.post(cfg["discord_webhook_url"], json=payload, timeout=10)
+        print(f"[✓] Discord sent!" if r.status_code in (200, 204) else f"[✗] Discord {r.status_code}: {r.text}")
     except Exception as e:
         print(f"[✗] Discord error: {e}")
 
 
-def send_whatsapp_alerts(subject, device_name, address, time_str, maps_url):
-    if not CONFIG["whatsapp_enabled"]:
+def send_single_whatsapp(client, from_number, to_number, body):
+    """Send one WhatsApp message. Returns True on success, raises on failure."""
+    msg = client.messages.create(body=body, from_=from_number, to=to_number)
+    return msg.sid
+
+
+def send_whatsapp(cfg, subject, device_name, address, time_str, maps_url):
+    if not cfg["whatsapp_enabled"]:
+        return
+    if not cfg["twilio_account_sid"] or not cfg["twilio_auth_token"]:
+        print("[!] Twilio credentials missing.")
         return
     try:
         from twilio.rest import Client
-        client = Client(CONFIG["twilio_account_sid"], CONFIG["twilio_auth_token"])
 
+        # Build message body
         lines = [f"🚨 *{device_name} ENCONTRADO!*", ""]
-        if address:
-            lines.append(f"📍 *Lugar:* {address}")
-        if time_str:
-            lines.append(f"⏰ *Hora encontrado:* {time_str}")
-        if maps_url:
-            lines.append(f"🗺️ *Google Maps:* {maps_url}")
-        lines += ["", f"📧 {subject}", f"🕐 Alerta recibida: {datetime.now().strftime('%H:%M:%S')}"]
+        if address:  lines.append(f"📍 *Lugar:* {address}")
+        if time_str: lines.append(f"⏰ *Hora:* {time_str}")
+        if maps_url: lines.append(f"🗺️ *Mapa:* {maps_url}")
+        lines += ["", f"📧 {subject}", f"🕐 {datetime.now().strftime('%H:%M:%S')}"]
         body = "\n".join(lines)
 
-        numbers = [n for n in CONFIG["whatsapp_numbers"] if n and n.startswith("whatsapp:")]
-        if not numbers:
-            print("[!] No valid WhatsApp numbers found. Check WHATSAPP_TO env vars.")
-            return
+        # Primary client
+        primary_client = Client(cfg["twilio_account_sid"], cfg["twilio_auth_token"])
 
-        for number in numbers:
+        # Backup client (if configured)
+        has_backup = bool(cfg["twilio_backup_sid"] and cfg["twilio_backup_token"])
+        backup_client = Client(cfg["twilio_backup_sid"], cfg["twilio_backup_token"]) if has_backup else None
+
+        for number in cfg["whatsapp_numbers"]:
+            sent = False
+
+            # Try primary first
             try:
-                msg = client.messages.create(
-                    body=body,
-                    from_=CONFIG["twilio_whatsapp_from"],
-                    to=number
-                )
-                print(f"[✓] WhatsApp sent to {number} — SID: {msg.sid}")
+                sid = send_single_whatsapp(primary_client, cfg["twilio_whatsapp_from"], number, body)
+                print(f"[✓] WhatsApp (primary) → {number} ({sid})")
+                sent = True
             except Exception as e:
-                print(f"[✗] WhatsApp failed for {number}: {e}")
+                err = str(e)
+                if "429" in err or "daily messages limit" in err.lower() or "exceeded" in err.lower():
+                    print(f"[!] Primary Twilio hit rate limit for {number} — trying backup...")
+                else:
+                    print(f"[✗] Primary WhatsApp failed for {number}: {e}")
+
+            # Try backup if primary failed
+            if not sent:
+                if backup_client:
+                    try:
+                        sid = send_single_whatsapp(backup_client, cfg["twilio_backup_from"], number, body)
+                        print(f"[✓] WhatsApp (backup) → {number} ({sid})")
+                        sent = True
+                    except Exception as e2:
+                        print(f"[✗] Backup WhatsApp also failed for {number}: {e2}")
+                else:
+                    print(f"[!] No backup Twilio configured. Set TWILIO_BACKUP_SID and TWILIO_BACKUP_TOKEN in Railway.")
 
     except ImportError:
-        print("[✗] twilio not installed. Run: pip install twilio")
+        print("[✗] twilio not installed.")
     except Exception as e:
         print(f"[✗] WhatsApp error: {e}")
 
 
-def fire_all_alerts(subject, sender, body):
-    device_name, address, time_str, maps_url = parse_apple_iphone_email(subject, body)
-
-    print(f"\n{'='*60}")
-    print(f"🚨 MATCH FOUND!")
-    print(f"   Device  : {device_name}")
-    print(f"   Address : {address}")
-    print(f"   Time    : {time_str}")
-    print(f"   Maps    : {maps_url}")
-    print(f"{'='*60}\n")
-
-    send_discord_alert(subject, sender, body[:300], device_name, address, time_str, maps_url)
-    send_whatsapp_alerts(subject, device_name, address, time_str, maps_url)
-
+def fire_alerts(cfg, subject, sender, body):
+    device_name, address, time_str, maps_url = parse_apple_email(subject, body)
+    print(f"\n{'='*55}")
+    print(f"🚨 MATCH! Device={device_name} | Addr={address} | Time={time_str}")
+    print(f"{'='*55}\n")
+    send_discord(cfg, subject, sender, body[:300], device_name, address, time_str, maps_url)
+    send_whatsapp(cfg, subject, device_name, address, time_str, maps_url)
 
 # ─────────────────────────────────────────────
-#  EMAIL CHECKING
+#  EMAIL
 # ─────────────────────────────────────────────
 
-def get_email_body(msg):
-    body = ""
+def get_body(msg):
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain":
-                try:
-                    body = part.get_payload(decode=True).decode("utf-8", errors="replace")
-                    break
-                except:
-                    pass
+                try: return part.get_payload(decode=True).decode("utf-8", errors="replace").strip()
+                except: pass
     else:
-        try:
-            body = msg.get_payload(decode=True).decode("utf-8", errors="replace")
-        except:
-            pass
-    return body.strip()
+        try: return msg.get_payload(decode=True).decode("utf-8", errors="replace").strip()
+        except: pass
+    return ""
 
 
-def email_matches(subject, sender):
-    subject_lower = subject.lower()
-    sender_lower  = sender.lower()
-    subject_match = any(kw.lower() in subject_lower for kw in CONFIG["watch_subject_keywords"])
-    sender_match  = any(kw.lower() in sender_lower  for kw in CONFIG["watch_from_keywords"])
-    return subject_match and sender_match
+def matches(cfg, subject, sender):
+    s, f = subject.lower(), sender.lower()
+    return (any(k.lower() in s for k in cfg["watch_subject_keywords"]) and
+            any(k.lower() in f for k in cfg["watch_from_keywords"]))
 
 
-def check_gmail(already_seen_ids):
+def check_gmail(cfg, storage, seen_ids):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(CONFIG["gmail_address"], CONFIG["gmail_app_password"])
+        mail.login(cfg["gmail_address"], cfg["gmail_app_password"])
         mail.select("inbox")
 
         date_str = (datetime.now() - timedelta(hours=24)).strftime("%d-%b-%Y")
-        status, messages = mail.search(None, f'(SINCE {date_str})')
-
+        status, data = mail.search(None, f"(SINCE {date_str})")
         if status != "OK":
             mail.logout()
-            return already_seen_ids
+            return seen_ids
 
-        email_ids = messages[0].split()
-        new_seen  = set(already_seen_ids)
+        new_seen    = set(seen_ids)
+        newly_added = set()
 
-        for eid in email_ids:
+        for eid in data[0].split():
             eid_str = eid.decode()
-            if eid_str in already_seen_ids:
+            if eid_str in seen_ids:
                 continue
             new_seen.add(eid_str)
+            newly_added.add(eid_str)
 
-            status, data = mail.fetch(eid, "(RFC822)")
+            status, msg_data = mail.fetch(eid, "(RFC822)")
             if status != "OK":
                 continue
 
-            raw_email = data[0][1]
-            msg       = email.message_from_bytes(raw_email)
-            subject   = str(msg.get("Subject", ""))
-            sender    = str(msg.get("From", ""))
-            body      = get_email_body(msg)
+            msg     = email.message_from_bytes(msg_data[0][1])
+            subject = str(msg.get("Subject", ""))
+            sender  = str(msg.get("From", ""))
+            body    = get_body(msg)
 
-            if email_matches(subject, sender):
-                fire_all_alerts(subject, sender, body)
+            if matches(cfg, subject, sender):
+                fire_alerts(cfg, subject, sender, body)
 
         mail.logout()
+
+        if newly_added:
+            storage.save_seen_ids(newly_added)
+
         return new_seen
 
     except imaplib.IMAP4.error as e:
-        print(f"[!] Gmail login error: {e}")
-        return already_seen_ids
+        print(f"[!] Gmail auth error: {e}")
+        return seen_ids
     except Exception as e:
-        print(f"[!] Error checking Gmail: {e}")
-        return already_seen_ids
-
+        print(f"[!] Gmail error: {e}")
+        return seen_ids
 
 # ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
 def main():
-    numbers = [n for n in CONFIG["whatsapp_numbers"] if n and n.startswith("whatsapp:")]
-    print("=" * 60)
-    print("  📱 iPhone Found — Email Watcher")
-    print("=" * 60)
-    print(f"  Monitoring : {CONFIG['gmail_address']}")
-    print(f"  Interval   : every {CONFIG['check_interval_seconds']}s")
-    print(f"  Keywords   : {CONFIG['watch_subject_keywords']}")
-    print()
-    print("  Alerts:")
-    if CONFIG["discord_enabled"]:  print("    ✓ Discord")
-    if CONFIG["whatsapp_enabled"]: print(f"    ✓ WhatsApp → {len(numbers)} number(s)")
-    print()
-    print("  Press Ctrl+C to stop.")
-    print("=" * 60)
+    cfg     = load_config()
+    storage = connect_storage()
 
-    seen_ids = set()
-    print("\n[*] Initial scan...")
-    seen_ids = check_gmail(seen_ids)
-    print("[*] Watching for NEW emails now.\n")
+    print("=" * 55)
+    print("  📱 iPhone Watcher — Persistent")
+    print("=" * 55)
+    print(f"  Gmail    : {cfg['gmail_address']}")
+    print(f"  Interval : {cfg['check_interval_seconds']}s")
+    print(f"  Discord  : {'✓' if cfg['discord_enabled'] else '✗'}")
+    print(f"  WhatsApp : {len(cfg['whatsapp_numbers'])} number(s) → {cfg['whatsapp_numbers']}")
+    print("=" * 55)
+
+    # Load previously seen IDs from Redis/file
+    seen_ids = storage.get_seen_ids()
+    if seen_ids:
+        print(f"\n[✓] Loaded {len(seen_ids)} seen IDs — skipping old emails.")
+    else:
+        print("\n[*] First run — scanning existing emails to mark as seen...")
+        seen_ids = check_gmail(cfg, storage, seen_ids)
+        print("[*] Done. Only NEW emails will trigger alerts.\n")
 
     while True:
         try:
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] Checking...", end=" ", flush=True)
-            seen_ids = check_gmail(seen_ids)
+            seen_ids = check_gmail(cfg, storage, seen_ids)
             print("OK")
-            time.sleep(CONFIG["check_interval_seconds"])
+            time.sleep(cfg["check_interval_seconds"])
         except KeyboardInterrupt:
-            print("\n\n[*] Stopped.")
+            print("\n[*] Stopped.")
             sys.exit(0)
         except Exception as e:
-            print(f"\n[!] Error: {e}")
-            time.sleep(CONFIG["check_interval_seconds"])
+            print(f"\n[!] Unexpected error: {e}")
+            time.sleep(cfg["check_interval_seconds"])
 
 
 if __name__ == "__main__":
