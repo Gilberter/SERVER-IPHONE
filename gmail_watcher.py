@@ -81,31 +81,6 @@ def send_discord_alert(subject, sender, body_preview):
         print(f"[✗] Discord error: {e}")
 
 
-def send_telegram_alert(subject, sender, body_preview):
-    """Send alert via Telegram bot."""
-    if not CONFIG["telegram_enabled"]:
-        return
-    try:
-        text = (
-            f"🚨 *IPHONE ALERT!*\n\n"
-            f"*Subject:* {subject}\n"
-            f"*From:* {sender}\n"
-            f"*Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"*Preview:*\n{body_preview[:400]}"
-        )
-        url = f"https://api.telegram.org/bot{CONFIG['telegram_bot_token']}/sendMessage"
-        r = requests.post(url, json={
-            "chat_id": CONFIG["telegram_chat_id"],
-            "text": text,
-            "parse_mode": "Markdown"
-        }, timeout=10)
-        if r.ok:
-            print(f"[✓] Telegram alert sent!")
-        else:
-            print(f"[✗] Telegram failed: {r.text}")
-    except Exception as e:
-        print(f"[✗] Telegram error: {e}")
-
 
 def send_whatsapp_alert(subject, sender, body_preview):
     """Send WhatsApp alert via Twilio."""
@@ -132,40 +107,7 @@ def send_whatsapp_alert(subject, sender, body_preview):
         print(f"[✗] WhatsApp error: {e}")
 
 
-def send_windows_notification(subject, body_preview):
-    """Show Windows desktop notification."""
-    if not CONFIG["windows_notification_enabled"]:
-        return
-    try:
-        from win10toast import ToastNotifier
-        toaster = ToastNotifier()
-        toaster.show_toast(
-            "🚨 IPHONE ALERT!",
-            f"{subject}\n{body_preview[:100]}",
-            duration=30,
-            threaded=True
-        )
-        print("[✓] Windows notification sent!")
-    except ImportError:
-        # Fallback: use PowerShell
-        try:
-            import subprocess
-            ps_script = f'''
-            Add-Type -AssemblyName System.Windows.Forms
-            $notification = New-Object System.Windows.Forms.NotifyIcon
-            $notification.Icon = [System.Drawing.SystemIcons]::Warning
-            $notification.BalloonTipTitle = "IPHONE ALERT!"
-            $notification.BalloonTipText = "{subject[:100]}"
-            $notification.Visible = $True
-            $notification.ShowBalloonTip(30000)
-            Start-Sleep -Seconds 5
-            '''
-            subprocess.Popen(["powershell", "-Command", ps_script])
-            print("[✓] Windows notification sent (via PowerShell)!")
-        except Exception as e2:
-            print(f"[✗] Windows notification error: {e2}")
-    except Exception as e:
-        print(f"[✗] Windows notification error: {e}")
+
 
 
 def fire_all_alerts(subject, sender, body_preview):
@@ -178,9 +120,7 @@ def fire_all_alerts(subject, sender, body_preview):
     print(f"{'='*60}\n")
 
     send_discord_alert(subject, sender, body_preview)
-    send_telegram_alert(subject, sender, body_preview)
     send_whatsapp_alert(subject, sender, body_preview)
-    send_windows_notification(subject, body_preview)
 
 
 # ─────────────────────────────────────────────
@@ -283,9 +223,7 @@ def main():
     print()
     print("  Alerts enabled:")
     if CONFIG["discord_enabled"]:   print("    ✓ Discord")
-    if CONFIG["telegram_enabled"]:  print("    ✓ Telegram")
     if CONFIG["whatsapp_enabled"]:  print("    ✓ WhatsApp")
-    if CONFIG["windows_notification_enabled"]: print("    ✓ Windows Desktop Notification")
     print()
     print("  Press Ctrl+C to stop.")
     print("=" * 60)
