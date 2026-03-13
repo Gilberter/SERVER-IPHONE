@@ -46,7 +46,9 @@ CONFIG = {
         os.environ.get("WHATSAPP_TO",   "whatsapp:+573174924147"),
         os.environ.get("WHATSAPP_TO_2", ""), # whatsapp:+573156356850
         os.environ.get("WHATSAPP_TO_3", ""), #whatsapp:+573153038988
-        os.environ.get("WHATSAPP_TO_3", "whatsapp:+573203446002"),
+        os.environ.get("WHATSAPP_TO_4", "whatsapp:+573203446002"),
+        os.environ.get("WHATSAPP_TO_5", "whatsapp:+573203446002"),
+
     ],
 
     # ─── Windows Desktop Notification ───
