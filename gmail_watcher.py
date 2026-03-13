@@ -1,8 +1,9 @@
 """
 iPhone Found Email Watcher
 ==========================
-Persistent version — uses Redis to remember seen emails across restarts.
-So you can redeploy/update without re-sending old alerts.
+Monitors your Gmail for Apple's "iPhone Found" alert email.
+When detected, sends alerts to Discord and WhatsApp (multiple numbers).
+Parses Apple's Spanish email format and includes a Google Maps link.
 """
 
 import imaplib
@@ -20,111 +21,48 @@ import sys
 # ─────────────────────────────────────────────
 
 CONFIG = {
+    # --- Gmail ---
     "gmail_address":      os.environ["GMAIL_ADDRESS"],
     "gmail_app_password": os.environ["GMAIL_APP_PASSWORD"],
 
+    # --- What email to watch for ---
     "watch_subject_keywords": ["iPhone", "encontró", "found", "located", "Find My"],
     "watch_from_keywords":    ["apple.com", "icloud.com"],
 
+    # --- How often to check (seconds) ---
     "check_interval_seconds": 60,
 
+    # ─── Discord ───
     "discord_enabled":     True,
     "discord_webhook_url": os.environ["DISCORD_WEBHOOK_URL"],
 
+    # ─── WhatsApp via Twilio ───
+    # Add as many numbers as you want via env vars WHATSAPP_TO, WHATSAPP_TO_2, WHATSAPP_TO_3
     "whatsapp_enabled":     True,
     "twilio_account_sid":   os.environ["TWILIO_ACCOUNT_SID"],
     "twilio_auth_token":    os.environ["TWILIO_AUTH_TOKEN"],
     "twilio_whatsapp_from": "whatsapp:+14155238886",
     "whatsapp_numbers": [
-        os.environ.get("WHATSAPP_TO",   ""),
-        os.environ.get("WHATSAPP_TO_2", ""),
-        os.environ.get("WHATSAPP_TO_3", ""),
-        os.environ.get("WHATSAPP_TO_4", ""),
-        os.environ.get("WHATSAPP_TO_5", ""),
+        os.environ.get("WHATSAPP_TO",   "whatsapp:+573174924147"),
+        os.environ.get("WHATSAPP_TO_2", ""), # whatsapp:+573156356850
+        os.environ.get("WHATSAPP_TO_3", ""), #whatsapp:+573153038988
+        os.environ.get("WHATSAPP_TO_3", "whatsapp:+573203446002"),
     ],
 
+    # ─── Windows Desktop Notification ───
     "windows_notification_enabled": False,
 }
 
 # ─────────────────────────────────────────────
-#  PERSISTENT STORAGE (Redis or local file)
-# ─────────────────────────────────────────────
-
-def get_storage():
-    """
-    Returns a storage object with get_seen_ids() and save_seen_ids().
-    Uses Redis if REDIS_URL is set (Railway Redis), otherwise falls back
-    to a local file (good for local testing).
-    """
-    redis_url = os.environ.get("REDIS_URL") or os.environ.get("REDIS_PRIVATE_URL")
-
-    if redis_url:
-        try:
-            import redis
-            client = redis.from_url(redis_url, decode_responses=True)
-            client.ping()
-            print("[✓] Connected to Redis — seen IDs will persist across restarts.")
-            return RedisStorage(client)
-        except Exception as e:
-            print(f"[!] Redis connection failed: {e}. Falling back to local file.")
-
-    print("[~] Using local file storage (seen_ids.txt). Note: resets on Railway redeploy.")
-    return FileStorage("seen_ids.txt")
-
-
-class RedisStorage:
-    KEY = "iphone_watcher:seen_ids"
-
-    def __init__(self, client):
-        self.client = client
-
-    def get_seen_ids(self):
-        try:
-            members = self.client.smembers(self.KEY)
-            return set(members)
-        except Exception as e:
-            print(f"[!] Redis read error: {e}")
-            return set()
-
-    def save_seen_ids(self, seen_ids):
-        try:
-            if seen_ids:
-                self.client.sadd(self.KEY, *seen_ids)
-            # Keep only last 10000 IDs to avoid unbounded growth
-            size = self.client.scard(self.KEY)
-            if size > 10000:
-                # Remove random old members (Redis sets don't have order)
-                excess = self.client.spop(self.KEY, size - 10000)
-        except Exception as e:
-            print(f"[!] Redis write error: {e}")
-
-
-class FileStorage:
-    def __init__(self, path):
-        self.path = path
-
-    def get_seen_ids(self):
-        try:
-            if os.path.exists(self.path):
-                with open(self.path, "r") as f:
-                    return set(line.strip() for line in f if line.strip())
-        except Exception as e:
-            print(f"[!] File read error: {e}")
-        return set()
-
-    def save_seen_ids(self, seen_ids):
-        try:
-            with open(self.path, "w") as f:
-                f.write("\n".join(seen_ids))
-        except Exception as e:
-            print(f"[!] File write error: {e}")
-
-
-# ─────────────────────────────────────────────
-#  PARSE APPLE EMAIL
+#  PARSE APPLE'S EMAIL
 # ─────────────────────────────────────────────
 
 def parse_apple_iphone_email(subject, body):
+    """
+    Parses Apple's Spanish Find My email:
+    'iPhone de Juan David se encontró cerca de Calle 20 28-49 Bucaramanga, Santander Colombia a la(s) 15:49 COT'
+    Returns: (device_name, address, time_str, maps_url)
+    """
     device_name = "Tu iPhone"
     address     = None
     time_str    = None
@@ -134,7 +72,7 @@ def parse_apple_iphone_email(subject, body):
         if not text:
             continue
 
-        # Spanish: "iPhone de X se encontró cerca de ADDRESS a la(s) HH:MM TZ"
+        # Spanish format
         match = re.search(
             r'(iPhone[^\.]*?)se encontr[oó] cerca de (.+?) a la\(?s?\)?\s+([\d:]+)\s*(\w+)',
             text, re.IGNORECASE
@@ -171,18 +109,18 @@ def send_discord_alert(subject, sender, body_preview, device_name, address, time
         return
     try:
         fields = [
-            {"name": "📧 Subject",    "value": subject, "inline": False},
-            {"name": "📨 From",       "value": sender,  "inline": True},
-            {"name": "🕐 Alert time", "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "inline": True},
+            {"name": "📧 Subject",      "value": subject, "inline": False},
+            {"name": "📨 From",         "value": sender,  "inline": True},
+            {"name": "🕐 Alert time",   "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "inline": True},
         ]
         if address:
-            fields.append({"name": "📍 Location",    "value": address,  "inline": False})
+            fields.append({"name": "📍 Location",   "value": address,  "inline": False})
         if time_str:
-            fields.append({"name": "⏰ Time found",  "value": time_str, "inline": True})
+            fields.append({"name": "⏰ Time found", "value": time_str, "inline": True})
         if maps_url:
-            fields.append({"name": "🗺️ Google Maps", "value": f"[📍 Abrir en Google Maps]({maps_url})", "inline": True})
+            fields.append({"name": "🗺️ Google Maps","value": f"[📍 Open in Google Maps]({maps_url})", "inline": True})
         if body_preview:
-            fields.append({"name": "📝 Preview",     "value": body_preview[:300] or "(empty)", "inline": False})
+            fields.append({"name": "📝 Preview",    "value": body_preview[:300] or "(empty)", "inline": False})
 
         message = {
             "embeds": [{
@@ -213,15 +151,15 @@ def send_whatsapp_alerts(subject, device_name, address, time_str, maps_url):
         if address:
             lines.append(f"📍 *Lugar:* {address}")
         if time_str:
-            lines.append(f"⏰ *Hora:* {time_str}")
+            lines.append(f"⏰ *Hora encontrado:* {time_str}")
         if maps_url:
             lines.append(f"🗺️ *Google Maps:* {maps_url}")
-        lines += ["", f"📧 {subject}", f"🕐 {datetime.now().strftime('%H:%M:%S')}"]
+        lines += ["", f"📧 {subject}", f"🕐 Alerta recibida: {datetime.now().strftime('%H:%M:%S')}"]
         body = "\n".join(lines)
 
         numbers = [n for n in CONFIG["whatsapp_numbers"] if n and n.startswith("whatsapp:")]
         if not numbers:
-            print("[!] No valid WhatsApp numbers configured.")
+            print("[!] No valid WhatsApp numbers found. Check WHATSAPP_TO env vars.")
             return
 
         for number in numbers:
@@ -231,12 +169,12 @@ def send_whatsapp_alerts(subject, device_name, address, time_str, maps_url):
                     from_=CONFIG["twilio_whatsapp_from"],
                     to=number
                 )
-                print(f"[✓] WhatsApp → {number} SID: {msg.sid}")
+                print(f"[✓] WhatsApp sent to {number} — SID: {msg.sid}")
             except Exception as e:
                 print(f"[✗] WhatsApp failed for {number}: {e}")
 
     except ImportError:
-        print("[✗] twilio not installed.")
+        print("[✗] twilio not installed. Run: pip install twilio")
     except Exception as e:
         print(f"[✗] WhatsApp error: {e}")
 
@@ -286,7 +224,7 @@ def email_matches(subject, sender):
     return subject_match and sender_match
 
 
-def check_gmail(already_seen_ids, storage):
+def check_gmail(already_seen_ids):
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(CONFIG["gmail_address"], CONFIG["gmail_app_password"])
@@ -301,15 +239,12 @@ def check_gmail(already_seen_ids, storage):
 
         email_ids = messages[0].split()
         new_seen  = set(already_seen_ids)
-        newly_added = set()
 
         for eid in email_ids:
             eid_str = eid.decode()
             if eid_str in already_seen_ids:
                 continue
-
             new_seen.add(eid_str)
-            newly_added.add(eid_str)
 
             status, data = mail.fetch(eid, "(RFC822)")
             if status != "OK":
@@ -325,11 +260,6 @@ def check_gmail(already_seen_ids, storage):
                 fire_all_alerts(subject, sender, body)
 
         mail.logout()
-
-        # Persist any newly seen IDs
-        if newly_added:
-            storage.save_seen_ids(new_seen)
-
         return new_seen
 
     except imaplib.IMAP4.error as e:
@@ -346,35 +276,30 @@ def check_gmail(already_seen_ids, storage):
 
 def main():
     numbers = [n for n in CONFIG["whatsapp_numbers"] if n and n.startswith("whatsapp:")]
-
     print("=" * 60)
-    print("  📱 iPhone Found — Email Watcher (Persistent)")
+    print("  📱 iPhone Found — Email Watcher")
     print("=" * 60)
     print(f"  Monitoring : {CONFIG['gmail_address']}")
     print(f"  Interval   : every {CONFIG['check_interval_seconds']}s")
+    print(f"  Keywords   : {CONFIG['watch_subject_keywords']}")
     print()
     print("  Alerts:")
     if CONFIG["discord_enabled"]:  print("    ✓ Discord")
     if CONFIG["whatsapp_enabled"]: print(f"    ✓ WhatsApp → {len(numbers)} number(s)")
     print()
+    print("  Press Ctrl+C to stop.")
+    print("=" * 60)
 
-    # Connect to storage
-    storage  = get_storage()
-    seen_ids = storage.get_seen_ids()
-
-    if seen_ids:
-        print(f"[✓] Loaded {len(seen_ids)} previously seen email IDs from storage.")
-        print("[*] Skipping those — only NEW emails will trigger alerts.\n")
-    else:
-        print("[*] No previous state found. Doing initial scan to mark existing emails...\n")
-        seen_ids = check_gmail(seen_ids, storage)
-        print("[*] Done. Watching for NEW emails now.\n")
+    seen_ids = set()
+    print("\n[*] Initial scan...")
+    seen_ids = check_gmail(seen_ids)
+    print("[*] Watching for NEW emails now.\n")
 
     while True:
         try:
             now = datetime.now().strftime("%H:%M:%S")
             print(f"[{now}] Checking...", end=" ", flush=True)
-            seen_ids = check_gmail(seen_ids, storage)
+            seen_ids = check_gmail(seen_ids)
             print("OK")
             time.sleep(CONFIG["check_interval_seconds"])
         except KeyboardInterrupt:
