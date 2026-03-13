@@ -1,0 +1,1 @@
+worker: python gmail_watcher.py
